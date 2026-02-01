@@ -14,6 +14,7 @@
 use super::{HttpState, RequestStatus, ShareRequest};
 use crate::share::{Share, ShareMode};
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     middleware,
@@ -43,6 +44,12 @@ pub struct ShareResponse {
 #[derive(Debug, Deserialize)]
 pub struct RemoveShareQuery {
     pub path: String,
+}
+
+/// Request body for denying a share request.
+#[derive(Debug, Deserialize)]
+pub struct DenyRequestBody {
+    pub reason: Option<String>,
 }
 
 /// List all shares.
@@ -163,7 +170,17 @@ async fn approve_request(
 async fn deny_request(
     State(state): State<Arc<HttpState>>,
     Path(id): Path<u64>,
+    body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Parse optional JSON body for reason
+    let deny_reason = if body.is_empty() {
+        None
+    } else {
+        let parsed: DenyRequestBody = serde_json::from_slice(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
+        parsed.reason
+    };
+
     let mut requests = state.pending_requests.write().await;
 
     // Find the request
@@ -180,8 +197,12 @@ async fn deny_request(
     }
 
     request.status = RequestStatus::Denied;
+    request.deny_reason = deny_reason;
 
-    log::info!("Denied share request {}: {}", id, request.path);
+    let reason_msg = request.deny_reason.as_ref()
+        .map(|r| format!(" (reason: {})", r))
+        .unwrap_or_default();
+    log::info!("Denied share request {}: {}{}", id, request.path, reason_msg);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -210,8 +231,8 @@ pub fn create_router(state: Arc<HttpState>, token: Option<String>) -> Router {
         .route("/shares", get(list_shares).post(add_share))
         .route("/shares", delete(remove_share))
         .route("/pending-requests", get(list_pending_requests))
-        .route("/pending-requests/{id}/approve", post(approve_request))
-        .route("/pending-requests/{id}/deny", post(deny_request))
+        .route("/pending-requests/:id/approve", post(approve_request))
+        .route("/pending-requests/:id/deny", post(deny_request))
         .with_state(state);
 
     // Add authentication middleware if token is configured

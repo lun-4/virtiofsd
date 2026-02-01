@@ -31,6 +31,8 @@ pub struct HttpConfig {
     pub vm_token: Option<String>,
     /// Token for Admin API authentication.
     pub admin_token: Option<String>,
+    /// VM name for desktop notifications.
+    pub vm_name: Option<String>,
 }
 
 /// Pending share request from VM.
@@ -44,6 +46,9 @@ pub struct ShareRequest {
     pub mode: String,
     /// Request status: pending, approved, denied.
     pub status: RequestStatus,
+    /// Reason for denial (if denied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_reason: Option<String>,
 }
 
 /// Status of a share request.
@@ -100,7 +105,7 @@ pub async fn start_http_servers(
     let admin_addr = SocketAddr::from(([0, 0, 0, 0], config.admin_api_port));
 
     // Create VM API router
-    let vm_router = vm::create_router(Arc::clone(&state), config.vm_token.clone());
+    let vm_router = vm::create_router(Arc::clone(&state), config.vm_token.clone(), config.vm_name.clone());
     let vm_addr = SocketAddr::from(([0, 0, 0, 0], config.vm_api_port));
 
     log::info!("Starting Admin API on {}", admin_addr);

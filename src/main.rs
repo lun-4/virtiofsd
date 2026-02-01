@@ -507,6 +507,13 @@ struct Opt {
     /// Can also be set via VIRTIOFSD_ADMIN_TOKEN environment variable.
     #[arg(long = "admin-token", env = "VIRTIOFSD_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// VM name for desktop notifications.
+    ///
+    /// When a VM requests a share, a desktop notification is sent.
+    /// This name identifies the VM in the notification.
+    #[arg(long = "vm-name")]
+    vm_name: Option<String>,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -1015,6 +1022,7 @@ fn main() {
                 admin_api_port: opt.admin_api_port,
                 vm_token: opt.vm_token.clone(),
                 admin_token: opt.admin_token.clone(),
+                vm_name: opt.vm_name.clone(),
             };
 
             // Spawn HTTP servers in a separate thread with tokio runtime
