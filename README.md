@@ -1,7 +1,12 @@
-# virtiofsd
+# luna's virtiofsd
 
-A [virtio-fs](https://virtio-fs.gitlab.io/) vhost-user device daemon
-written in Rust.
+A [virtio-fs](https://virtio-fs.gitlab.io/) vhost-user device daemon written in Rust.
+
+:warning: :warning: :warning: **HAZARDOUS CODE INSIDE**
+
+this fork, made by `lun-4`, is specifically made as an experiment for
+the https://github.com/lun-4/homura project. do not use this without proper warning or
+at least talking to me to understand what do you need
 
 ## Building from sources
 

@@ -22,15 +22,20 @@ use vhost::vhost_user::Listener;
 use vhost_user_backend::Error::HandleRequest;
 use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
+#[cfg(feature = "http-control")]
+use virtiofsd::http::{HttpConfig, start_http_servers};
+use virtiofsd::merged_fs::MergedPathFs;
 use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{
     self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, PassthroughFs,
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
+use virtiofsd::share::Share;
 use virtiofsd::util::write_pid_file;
 use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
 use virtiofsd::{limits, oslib, soft_idmap};
+use std::path::PathBuf;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
 /// Maximum number of memory areas (slots) supported by the vhost-user-backend crate.
@@ -60,6 +65,43 @@ fn parse_seccomp(src: &str) -> std::result::Result<SeccompAction, &'static str> 
         "trap" => SeccompAction::Trap,
         _ => return Err("Matching variant not found"),
     })
+}
+
+/// Find the common ancestor directory of a list of paths.
+fn find_common_ancestor(paths: &[&std::path::Path]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    if paths.len() == 1 {
+        // Single path - use its parent
+        return paths[0].parent().map(|p| p.to_string_lossy().to_string());
+    }
+
+    // Get components of the first path
+    let first: Vec<_> = paths[0].components().collect();
+
+    // Find how many components are common to all paths
+    let mut common_len = first.len();
+    for path in &paths[1..] {
+        let components: Vec<_> = path.components().collect();
+        let mut matching = 0;
+        for (a, b) in first.iter().zip(components.iter()) {
+            if a == b {
+                matching += 1;
+            } else {
+                break;
+            }
+        }
+        common_len = common_len.min(matching);
+    }
+
+    if common_len == 0 {
+        return None;
+    }
+
+    // Build the common ancestor path
+    let ancestor: std::path::PathBuf = first[..common_len].iter().collect();
+    Some(ancestor.to_string_lossy().to_string())
 }
 
 /// On the command line, we want to allow aliases for `InodeFileHandlesMode` values.  This enum has
@@ -122,7 +164,9 @@ fn parse_tag(tag: &str) -> Result<String> {
 )]
 struct Opt {
     /// Shared directory path
-    #[arg(long, required_unless_present_any = &["compat_options", "print_capabilities"])]
+    ///
+    /// Not required when using --share for multi-path mode.
+    #[arg(long, required_unless_present_any = &["compat_options", "print_capabilities", "shares"])]
     shared_dir: Option<String>,
 
     /// The tag that the virtio device advertises
@@ -412,6 +456,57 @@ struct Opt {
     /// This parameter is ignored on the destination side.
     #[arg(long = "migration-confirm-paths")]
     migration_confirm_paths: bool,
+
+    // Dynamic path sharing options
+    /// Share a host path with the guest with specified permissions.
+    ///
+    /// Format: path:mode where mode is 'ro' (read-only) or 'rw' (read-write).
+    /// Can be specified multiple times to share multiple paths.
+    /// When --share is used, --sandbox=none is required and --shared-dir is not used.
+    ///
+    /// Examples:
+    ///   --share=/home/user:ro --share=/home/user/project:rw
+    #[arg(long = "share", value_parser = |s: &str| s.parse::<Share>())]
+    shares: Vec<Share>,
+
+    /// Prefix path for shared directories in the guest view.
+    ///
+    /// If set, all shared paths will appear under this prefix in the guest.
+    /// For example, with --mount-prefix=/mnt/host, a share of /home/user
+    /// would appear as /mnt/host/home/user in the guest.
+    #[arg(long = "mount-prefix")]
+    mount_prefix: Option<PathBuf>,
+
+    /// Enable HTTP control plane for dynamic share management.
+    ///
+    /// When enabled, starts HTTP APIs for VM and Admin access.
+    /// Requires --vm-api-port and --admin-api-port.
+    #[arg(long = "http-control")]
+    http_control: bool,
+
+    /// Port for VM-facing HTTP API (guest access to request shares).
+    ///
+    /// Only used when --http-control is enabled.
+    #[arg(long = "vm-api-port", default_value = "9000")]
+    vm_api_port: u16,
+
+    /// Port for Admin HTTP API (host user access to manage shares).
+    ///
+    /// Only used when --http-control is enabled.
+    #[arg(long = "admin-api-port", default_value = "9001")]
+    admin_api_port: u16,
+
+    /// Authentication token for VM API access.
+    ///
+    /// Can also be set via VIRTIOFSD_VM_TOKEN environment variable.
+    #[arg(long = "vm-token", env = "VIRTIOFSD_VM_TOKEN")]
+    vm_token: Option<String>,
+
+    /// Authentication token for Admin API access.
+    ///
+    /// Can also be set via VIRTIOFSD_ADMIN_TOKEN environment variable.
+    #[arg(long = "admin-token", env = "VIRTIOFSD_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -650,18 +745,58 @@ fn main() {
     initialize_logging(&opt);
     set_signal_handlers();
 
-    let shared_dir = match opt.shared_dir.as_ref() {
-        Some(s) => s,
-        None => {
-            error!("missing \"--shared-dir\" or \"-o source\" option");
+    // Determine if we're using multi-path share mode
+    let using_shares = !opt.shares.is_empty();
+
+    // Validate share mode requirements
+    if using_shares {
+        if opt.sandbox != SandboxMode::None {
+            error!("Multi-path sharing (--share) requires --sandbox=none");
             process::exit(1);
+        }
+        if opt.readonly {
+            error!("--readonly cannot be used with --share (use :ro suffix instead)");
+            process::exit(1);
+        }
+        info!(
+            "Using multi-path share mode with {} share(s)",
+            opt.shares.len()
+        );
+        for share in &opt.shares {
+            info!("  Share: {}", share);
+        }
+    }
+
+    // Determine the root directory
+    let shared_dir = if using_shares {
+        // In share mode, find the common ancestor of all shares
+        // or use --shared-dir if provided
+        if let Some(s) = opt.shared_dir.as_ref() {
+            s.clone()
+        } else {
+            // Find common ancestor of all share paths
+            let paths: Vec<_> = opt.shares.iter().map(|s| s.path()).collect();
+            find_common_ancestor(&paths).unwrap_or_else(|| {
+                error!("Cannot find common ancestor for shares. Please specify --shared-dir");
+                process::exit(1);
+            })
+        }
+    } else {
+        match opt.shared_dir.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                error!("missing \"--shared-dir\" or \"-o source\" option (or use --share)");
+                process::exit(1);
+            }
         }
     };
 
-    let shadir_path = Path::new(shared_dir);
-    if !shadir_path.is_dir() && !shadir_path.is_file() {
-        error!("{shared_dir} does not exist");
-        process::exit(1);
+    if !using_shares {
+        let shadir_path = Path::new(&shared_dir);
+        if !shadir_path.is_dir() && !shadir_path.is_file() {
+            error!("{shared_dir} does not exist");
+            process::exit(1);
+        }
     }
 
     if opt.compat_foreground {
@@ -863,7 +998,45 @@ fn main() {
         drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
     }
 
-    if opt.readonly {
+    if using_shares {
+        // Multi-path share mode - use MergedPathFs
+        let fs = MergedPathFs::new(fs_cfg, opt.shares, opt.mount_prefix.clone()).unwrap_or_else(|e| {
+            error!("Failed to create merged filesystem: {e}");
+            process::exit(1);
+        });
+        info!("Starting virtiofsd with {} share(s)", fs.registry().len());
+
+        // Start HTTP control plane if enabled
+        #[cfg(feature = "http-control")]
+        if opt.http_control {
+            let registry = Arc::clone(fs.registry());
+            let http_config = HttpConfig {
+                vm_api_port: opt.vm_api_port,
+                admin_api_port: opt.admin_api_port,
+                vm_token: opt.vm_token.clone(),
+                admin_token: opt.admin_token.clone(),
+            };
+
+            // Spawn HTTP servers in a separate thread with tokio runtime
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = start_http_servers(http_config, registry).await {
+                        error!("HTTP control plane error: {e}");
+                    }
+                });
+            });
+        }
+
+        #[cfg(not(feature = "http-control"))]
+        if opt.http_control {
+            error!("HTTP control plane requires the 'http-control' feature to be enabled");
+            error!("Rebuild with: cargo build --features http-control");
+            process::exit(1);
+        }
+
+        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+    } else if opt.readonly {
         let fs = PassthroughFsRo::new(fs_cfg).unwrap_or_else(|e| {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
@@ -917,5 +1090,64 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
             HandleRequest(Disconnected) => info!("Client disconnected, shutting down"),
             _ => error!("Waiting for daemon failed: {e:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_find_common_ancestor_single_path() {
+        let paths = vec![Path::new("/home/user/project")];
+        assert_eq!(
+            find_common_ancestor(&paths),
+            Some("/home/user".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_common_ancestor_siblings() {
+        let paths = vec![
+            Path::new("/home/user/project/a"),
+            Path::new("/home/user/project/b"),
+        ];
+        assert_eq!(
+            find_common_ancestor(&paths),
+            Some("/home/user/project".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_common_ancestor_nested() {
+        let paths = vec![
+            Path::new("/home/user"),
+            Path::new("/home/user/project"),
+            Path::new("/home/user/project/subdir"),
+        ];
+        assert_eq!(
+            find_common_ancestor(&paths),
+            Some("/home/user".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_common_ancestor_different_roots() {
+        let paths = vec![
+            Path::new("/home/user"),
+            Path::new("/opt/data"),
+        ];
+        // Common ancestor is "/"
+        assert_eq!(
+            find_common_ancestor(&paths),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_common_ancestor_empty() {
+        let paths: Vec<&Path> = vec![];
+        assert_eq!(find_common_ancestor(&paths), None);
     }
 }

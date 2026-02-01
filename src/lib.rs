@@ -9,9 +9,12 @@ pub mod descriptor_utils;
 pub mod file_traits;
 pub mod filesystem;
 pub mod fuse;
+#[cfg(feature = "http-control")]
+pub mod http;
 pub mod idmap;
 pub mod limits;
 pub mod macros;
+pub mod merged_fs;
 pub mod oslib;
 pub mod passthrough;
 pub mod read_dir;
@@ -19,6 +22,8 @@ pub mod sandbox;
 #[cfg(feature = "seccomp")]
 pub mod seccomp;
 pub mod server;
+pub mod share;
+pub mod share_registry;
 pub mod soft_idmap;
 pub mod util;
 pub mod vhost_user;
