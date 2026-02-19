@@ -214,6 +214,27 @@ impl MergedPathFs {
         }
     }
 
+    /// Check if creating a child entry under a parent inode is allowed.
+    ///
+    /// Unlike `check_inode_writable`, this checks the *child* path's permission,
+    /// which handles the case where the parent is an ancestor directory but the
+    /// child falls under an RW share (e.g., parent=/home/user, child=.claude.lock,
+    /// share=/home/user/.claude.lock:rw).
+    fn check_create_allowed(&self, parent: Inode, name: &CStr) -> io::Result<PathBuf> {
+        let parent_path = self.get_inode_path(parent).ok_or_else(enoent)?;
+        let name_str = name.to_str().map_err(|_| enoent())?;
+        let child_path = parent_path.join(name_str);
+
+        match self.registry.get_permission(&child_path) {
+            Some(ShareMode::ReadWrite) => Ok(parent_path),
+            Some(ShareMode::ReadOnly) => Err(erofs()),
+            None => {
+                // Child isn't directly under a share — fall back to parent check
+                self.check_inode_writable(parent)
+            }
+        }
+    }
+
     /// Check if a path should be visible based on the share configuration.
     fn is_path_visible(&self, path: &Path) -> bool {
         self.registry.is_path_visible(path)
@@ -576,8 +597,7 @@ impl FileSystem for MergedPathFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Check that we can write to the parent directory
-        let parent_path = self.check_inode_writable(parent)?;
+        let parent_path = self.check_create_allowed(parent, name)?;
         let name_str = name.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -596,7 +616,7 @@ impl FileSystem for MergedPathFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let parent_path = self.check_inode_writable(parent)?;
+        let parent_path = self.check_create_allowed(parent, name)?;
         let name_str = name.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -614,7 +634,7 @@ impl FileSystem for MergedPathFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let parent_path = self.check_inode_writable(parent)?;
+        let parent_path = self.check_create_allowed(parent, name)?;
         let name_str = name.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -624,12 +644,12 @@ impl FileSystem for MergedPathFs {
     }
 
     fn unlink(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        self.check_inode_writable(parent)?;
+        self.check_create_allowed(parent, name)?;
         self.inner.unlink(ctx, parent, name)
     }
 
     fn rmdir(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        self.check_inode_writable(parent)?;
+        self.check_create_allowed(parent, name)?;
         self.inner.rmdir(ctx, parent, name)
     }
 
@@ -642,9 +662,9 @@ impl FileSystem for MergedPathFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        // Both source and destination directories must be writable
-        self.check_inode_writable(olddir)?;
-        self.check_inode_writable(newdir)?;
+        // Both source and destination child paths must be writable
+        self.check_create_allowed(olddir, oldname)?;
+        self.check_create_allowed(newdir, newname)?;
         self.inner.rename(ctx, olddir, oldname, newdir, newname, flags)
     }
 
@@ -655,9 +675,9 @@ impl FileSystem for MergedPathFs {
         newparent: Self::Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
-        // Source must be visible, destination directory must be writable
+        // Source must be visible, destination child path must be writable
         self.check_inode_visible(inode)?;
-        let parent_path = self.check_inode_writable(newparent)?;
+        let parent_path = self.check_create_allowed(newparent, newname)?;
         let name_str = newname.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -694,7 +714,7 @@ impl FileSystem for MergedPathFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
-        let parent_path = self.check_inode_writable(parent)?;
+        let parent_path = self.check_create_allowed(parent, name)?;
         let name_str = name.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -1037,6 +1057,75 @@ mod tests {
 
         // O_PATH doesn't need write even with write flags
         assert!(!open_needs_write((libc::O_PATH | libc::O_RDWR) as u32));
+    }
+
+    #[test]
+    fn test_create_allowed_child_under_rw_share_in_ancestor_dir() {
+        // Scenario: parent=/home/luna is an ancestor (not directly shared),
+        // but child=/home/luna/.claude.lock is under an RW share.
+        // Creating .claude.lock should be allowed.
+        let registry = ShareRegistry::with_shares(vec![
+            make_share("/home/luna/.claude.lock", ShareMode::ReadWrite),
+        ]);
+
+        let parent = Path::new("/home/luna");
+        let child = parent.join(".claude.lock");
+
+        // Parent is not under any share — it's just an ancestor
+        assert_eq!(registry.get_permission(parent), None);
+        assert!(registry.is_ancestor_of_share(parent));
+
+        // But the child path IS under an RW share
+        assert_eq!(
+            registry.get_permission(&child),
+            Some(ShareMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn test_create_blocked_child_under_ro_share_in_ancestor_dir() {
+        // Parent is an ancestor, child falls under a read-only share.
+        let registry = ShareRegistry::with_shares(vec![
+            make_share("/home/luna/.config", ShareMode::ReadOnly),
+        ]);
+
+        let parent = Path::new("/home/luna");
+        let child = parent.join(".config");
+
+        assert_eq!(registry.get_permission(parent), None);
+        assert_eq!(
+            registry.get_permission(&child),
+            Some(ShareMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn test_create_child_not_under_any_share_falls_back_to_parent() {
+        // Parent is RW shared, child isn't specifically shared but inherits.
+        let registry = ShareRegistry::with_shares(vec![
+            make_share("/home/luna/project", ShareMode::ReadWrite),
+        ]);
+
+        let parent = Path::new("/home/luna/project");
+        let child = parent.join("newfile.txt");
+
+        // Child inherits parent's RW permission
+        assert_eq!(
+            registry.get_permission(&child),
+            Some(ShareMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn test_create_child_outside_all_shares_denied() {
+        // Parent has no share and is not an ancestor of any share.
+        let registry = ShareRegistry::with_shares(vec![
+            make_share("/home/luna/project", ShareMode::ReadWrite),
+        ]);
+
+        // /etc is completely outside all shares
+        assert_eq!(registry.get_permission(Path::new("/etc")), None);
+        assert!(!registry.is_ancestor_of_share(Path::new("/etc")));
     }
 
     #[test]

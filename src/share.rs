@@ -10,6 +10,46 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Canonicalize a path, even if it doesn't fully exist yet.
+///
+/// Walks up from the given path until an existing ancestor is found,
+/// canonicalizes that ancestor, then appends the remaining components.
+/// This allows sharing paths that will be created by the guest.
+fn canonicalize_or_resolve(path: &Path) -> std::io::Result<PathBuf> {
+    // Fast path: the full path exists
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+
+    // Walk up to find the deepest existing ancestor
+    let mut remaining = Vec::new();
+    let mut current = path.to_path_buf();
+
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&current) {
+            let mut result = canonical;
+            for component in remaining.into_iter().rev() {
+                result.push(component);
+            }
+            return Ok(result);
+        }
+
+        match current.file_name() {
+            Some(name) => {
+                remaining.push(name.to_os_string());
+                current.pop();
+            }
+            None => {
+                // No existing ancestor at all — shouldn't happen for absolute paths
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no existing ancestor for path '{}'", path.display()),
+                ));
+            }
+        }
+    }
+}
+
 /// Access mode for a shared path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,9 +108,11 @@ pub struct Share {
 impl Share {
     /// Create a new share with the given path and mode.
     ///
-    /// The path will be canonicalized.
+    /// The path will be canonicalized. If the path doesn't exist yet,
+    /// the longest existing ancestor is canonicalized and the remaining
+    /// components are appended.
     pub fn new(path: impl AsRef<Path>, mode: ShareMode) -> std::io::Result<Self> {
-        let canonical = std::fs::canonicalize(path.as_ref())?;
+        let canonical = canonicalize_or_resolve(path.as_ref())?;
         Ok(Share {
             path: canonical,
             mode,
@@ -131,11 +173,6 @@ impl FromStr for Share {
 
         let mode = mode_str.parse()?;
         let path = PathBuf::from(path_str);
-
-        // Verify the path exists
-        if !path.exists() {
-            return Err(ShareParseError::PathNotFound(path));
-        }
 
         Share::new(path, mode).map_err(|e| ShareParseError::IoError(e.to_string()))
     }
@@ -235,5 +272,47 @@ mod tests {
 
         let share2 = Share::new_unchecked(PathBuf::from("/"), ShareMode::ReadOnly);
         assert_eq!(share2.depth(), 1);
+    }
+
+    #[test]
+    fn test_share_new_nonexistent_path() {
+        // Create a temp dir as the existing ancestor
+        let tmp = std::env::temp_dir().join("virtiofsd_test_share_nonexist");
+        let _ = std::fs::create_dir(&tmp);
+
+        let nonexistent = tmp.join("does").join("not").join("exist");
+        assert!(!nonexistent.exists());
+
+        let share = Share::new(&nonexistent, ShareMode::ReadWrite).unwrap();
+        // The existing ancestor (tmp) should be canonicalized, rest appended
+        let canonical_tmp = std::fs::canonicalize(&tmp).unwrap();
+        assert_eq!(
+            share.path(),
+            canonical_tmp.join("does").join("not").join("exist")
+        );
+        assert_eq!(share.mode(), ShareMode::ReadWrite);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_share_parse_nonexistent_path() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_share_parse");
+        let _ = std::fs::create_dir(&tmp);
+
+        let spec = format!("{}/newdir:rw", tmp.display());
+        let share: Share = spec.parse().unwrap();
+        let canonical_tmp = std::fs::canonicalize(&tmp).unwrap();
+        assert_eq!(share.path(), canonical_tmp.join("newdir"));
+        assert_eq!(share.mode(), ShareMode::ReadWrite);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_canonicalize_or_resolve_existing_path() {
+        let tmp = std::env::temp_dir();
+        let resolved = canonicalize_or_resolve(&tmp).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&tmp).unwrap());
     }
 }
