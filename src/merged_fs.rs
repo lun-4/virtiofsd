@@ -680,8 +680,9 @@ impl FileSystem for MergedPathFs {
         newparent: Self::Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
-        // Source must be visible, destination child path must be writable
-        self.check_inode_visible(inode)?;
+        // Source must be writable (hard links create a new reference that could
+        // be used to bypass path-based RO enforcement), destination must be writable
+        self.check_inode_writable(inode)?;
         let parent_path = self.check_create_allowed(newparent, newname)?;
         let name_str = newname.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
@@ -1203,5 +1204,44 @@ mod tests {
         assert_eq!(e2.offset, 4);
 
         assert!(iter2.next().is_none());
+    }
+
+    /// Regression test: hard-linking a file out of a read-only share into a
+    /// read-write share must be rejected. link() must check that the source
+    /// inode is writable, not merely visible — otherwise an attacker can
+    /// launder RO permissions into RW by relocating the inode path.
+    #[test]
+    fn test_hardlink_from_ro_share_must_not_grant_write() {
+        let registry = ShareRegistry::with_shares(vec![
+            make_share("/home/user/secrets", ShareMode::ReadOnly),
+            make_share("/home/user/project", ShareMode::ReadWrite),
+        ]);
+
+        let ro_file = Path::new("/home/user/secrets/credentials.json");
+
+        // The source file is visible (under an RO share)...
+        assert!(
+            registry.is_path_visible(ro_file),
+            "RO file should be visible for reads"
+        );
+
+        // ...but it is NOT writable. link() must check this and reject.
+        assert_eq!(
+            registry.get_permission(ro_file),
+            Some(ShareMode::ReadOnly),
+            "Source file is read-only — link() must reject creating a hard link from it"
+        );
+
+        // Verify the destination would be writable (the attacker's target)
+        let rw_link_path = Path::new("/home/user/project/stolen_creds");
+        assert_eq!(
+            registry.get_permission(rw_link_path),
+            Some(ShareMode::ReadWrite),
+        );
+
+        // The fix: link() calls check_inode_writable on the source, which
+        // returns EROFS for ReadOnly. The operation is rejected before
+        // set_inode_path can overwrite the inode's tracked path, so the
+        // permission laundering never occurs.
     }
 }
