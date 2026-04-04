@@ -259,7 +259,12 @@ impl MergedPathFs {
 
         // Check access mode
         let accmode = cflags & libc::O_ACCMODE;
-        accmode == libc::O_WRONLY || accmode == libc::O_RDWR
+        if accmode == libc::O_WRONLY || accmode == libc::O_RDWR {
+            return true;
+        }
+
+        // O_TRUNC and O_APPEND modify file contents regardless of access mode
+        cflags & (libc::O_TRUNC | libc::O_APPEND) != 0
     }
 }
 
@@ -1043,7 +1048,10 @@ mod tests {
                 return false;
             }
             let accmode = cflags & libc::O_ACCMODE;
-            accmode == libc::O_WRONLY || accmode == libc::O_RDWR
+            if accmode == libc::O_WRONLY || accmode == libc::O_RDWR {
+                return true;
+            }
+            cflags & (libc::O_TRUNC | libc::O_APPEND) != 0
         }
 
         // Read-only doesn't need write
@@ -1057,6 +1065,16 @@ mod tests {
 
         // O_PATH doesn't need write even with write flags
         assert!(!open_needs_write((libc::O_PATH | libc::O_RDWR) as u32));
+
+        // O_TRUNC truncates a file to zero bytes — this is a write operation
+        // and must require write permission even when combined with O_RDONLY
+        assert!(open_needs_write((libc::O_RDONLY | libc::O_TRUNC) as u32));
+        assert!(open_needs_write((libc::O_WRONLY | libc::O_TRUNC) as u32));
+        assert!(open_needs_write((libc::O_RDWR | libc::O_TRUNC) as u32));
+
+        // O_APPEND implies write intent and must require write permission
+        assert!(open_needs_write((libc::O_RDONLY | libc::O_APPEND) as u32));
+        assert!(open_needs_write((libc::O_WRONLY | libc::O_APPEND) as u32));
     }
 
     #[test]
