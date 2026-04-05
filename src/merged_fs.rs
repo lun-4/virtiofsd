@@ -45,6 +45,51 @@ fn eacces() -> io::Error {
     io::Error::from_raw_os_error(libc::EACCES)
 }
 
+/// Validate that a FUSE name parameter is a single, safe path component.
+///
+/// Rejects names that could enable path traversal:
+/// - `".."` — parent directory traversal (CWE-22)
+/// - Names containing `'/'` — path separator injection
+/// - Empty names
+///
+/// A well-behaved guest kernel never sends these, but the FUSE transport
+/// allows a malicious guest to craft arbitrary requests. The share system
+/// exists to constrain such guests, so we must validate here.
+fn validate_fuse_name(name: &CStr) -> io::Result<&str> {
+    let s = name.to_str().map_err(|_| enoent())?;
+    if s.is_empty() || s == ".." || s.contains('/') {
+        return Err(enoent());
+    }
+    Ok(s)
+}
+
+/// Normalize a path by resolving `.` and `..` components logically.
+///
+/// Unlike `std::fs::canonicalize()`, this does not touch the filesystem —
+/// it purely manipulates path components. Used to determine where a symlink
+/// target would resolve to so we can check it against shares.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                // Don't pop past root
+                if matches!(parts.last(), Some(c) if *c != Component::RootDir) {
+                    parts.pop();
+                }
+            }
+            Component::CurDir => {} // skip "."
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        PathBuf::from("/")
+    } else {
+        parts.iter().collect()
+    }
+}
+
 /// Cached directory entry with owned data.
 #[derive(Clone)]
 struct CachedDirEntry {
@@ -214,6 +259,33 @@ impl MergedPathFs {
         }
     }
 
+    /// Validate that a symlink target resolves to a path within visible shares.
+    ///
+    /// Absolute targets are checked directly. Relative targets are resolved
+    /// against the parent directory (where the symlink is being created).
+    /// Returns `Err(EACCES)` if the resolved target is outside all shares.
+    fn validate_symlink_target(&self, parent_path: &Path, linkname: &CStr) -> io::Result<()> {
+        let target = linkname.to_str().map_err(|_| eacces())?;
+        let target_path = Path::new(target);
+
+        let resolved = if target_path.is_absolute() {
+            normalize_path(target_path)
+        } else {
+            normalize_path(&parent_path.join(target))
+        };
+
+        if self.registry.is_path_visible(&resolved) {
+            Ok(())
+        } else {
+            log::debug!(
+                "symlink target {:?} resolves to {:?} which is outside all shares",
+                target,
+                resolved
+            );
+            Err(eacces())
+        }
+    }
+
     /// Check if creating a child entry under a parent inode is allowed.
     ///
     /// Unlike `check_inode_writable`, this checks the *child* path's permission,
@@ -222,7 +294,7 @@ impl MergedPathFs {
     /// share=/home/user/.claude.lock:rw).
     fn check_create_allowed(&self, parent: Inode, name: &CStr) -> io::Result<PathBuf> {
         let parent_path = self.get_inode_path(parent).ok_or_else(enoent)?;
-        let name_str = name.to_str().map_err(|_| enoent())?;
+        let name_str = validate_fuse_name(name)?;
         let child_path = parent_path.join(name_str);
 
         match self.registry.get_permission(&child_path) {
@@ -309,8 +381,8 @@ impl FileSystem for MergedPathFs {
             enoent()
         })?;
 
-        // Build the full path for this entry
-        let name_str = name.to_str().map_err(|_| enoent())?;
+        // Validate name is a single safe component (rejects "..", "/", etc.)
+        let name_str = validate_fuse_name(name)?;
         let full_path = parent_path.join(name_str);
 
         // Check if this path should be visible
@@ -332,89 +404,142 @@ impl FileSystem for MergedPathFs {
 
     // Forget - clean up our inode path tracking
     fn forget(&self, ctx: Context, inode: Self::Inode, count: u64) {
-        // Note: We don't remove from inode_paths here because the kernel
-        // may still have references. The path tracking is eventually consistent
-        // and extra entries are harmless.
         self.inner.forget(ctx, inode, count);
+        // Remove stale path mapping so a recycled inode number cannot
+        // inherit the old inode's permissions.  If the kernel still holds
+        // references it will re-lookup before issuing further requests,
+        // which re-populates the mapping.
+        self.remove_inode_path(inode);
     }
 
     fn batch_forget(&self, ctx: Context, requests: Vec<(Self::Inode, u64)>) {
+        for &(inode, _) in &requests {
+            self.remove_inode_path(inode);
+        }
         self.inner.batch_forget(ctx, requests);
     }
 
-    // Read operations - allow through, visibility is checked at lookup
-    delegate_allow! {
-        fn getattr(&self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Option<Self::Handle>,
-        ) -> io::Result<(fuse::Attr, Duration)>;
-        fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>>;
-        fn read<W: ZeroCopyWriter>(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            w: W,
-            size: u32,
-            offset: u64,
-            lock_owner: Option<u64>,
-            flags: u32,
-        ) -> io::Result<usize>;
-        fn flush(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            lock_owner: u64,
-        ) -> io::Result<()>;
-        fn fsync(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            datasync: bool,
-            handle: Self::Handle,
-        ) -> io::Result<()>;
-        fn release(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            flags: u32,
-            handle: Self::Handle,
-            flush: bool,
-            flock_release: bool,
-            lock_owner: Option<u64>,
-        ) -> io::Result<()>;
-        fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64>;
-        fn getxattr(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            name: &CStr,
-            size: u32,
-        ) -> io::Result<GetxattrReply>;
-        fn listxattr(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            size: u32,
-        ) -> io::Result<ListxattrReply>;
-        fn fsyncdir(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            datasync: bool,
-            handle: Self::Handle,
-        ) -> io::Result<()>;
-        fn lseek(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            offset: u64,
-            whence: u32,
-        ) -> io::Result<u64>;
-        fn syncfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<()>;
+    // Read operations - recheck visibility against current share config
+    // before delegating, so that share removal at runtime is enforced.
+
+    fn getattr(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+    ) -> io::Result<(fuse::Attr, Duration)> {
+        self.check_inode_visible(inode)?;
+        self.inner.getattr(ctx, inode, handle)
+    }
+
+    fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        self.check_inode_visible(inode)?;
+        self.inner.readlink(ctx, inode)
+    }
+
+    fn read<W: ZeroCopyWriter>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: W,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.check_inode_visible(inode)?;
+        self.inner.read(ctx, inode, handle, w, size, offset, lock_owner, flags)
+    }
+
+    fn flush(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        lock_owner: u64,
+    ) -> io::Result<()> {
+        self.check_inode_visible(inode)?;
+        self.inner.flush(ctx, inode, handle, lock_owner)
+    }
+
+    fn fsync(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        self.check_inode_visible(inode)?;
+        self.inner.fsync(ctx, inode, datasync, handle)
+    }
+
+    fn release(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        flags: u32,
+        handle: Self::Handle,
+        flush: bool,
+        flock_release: bool,
+        lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        self.check_inode_visible(inode)?;
+        self.inner.release(ctx, inode, flags, handle, flush, flock_release, lock_owner)
+    }
+
+    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+        self.check_inode_visible(inode)?;
+        self.inner.statfs(ctx, inode)
+    }
+
+    fn getxattr(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        self.check_inode_visible(inode)?;
+        self.inner.getxattr(ctx, inode, name, size)
+    }
+
+    fn listxattr(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        self.check_inode_visible(inode)?;
+        self.inner.listxattr(ctx, inode, size)
+    }
+
+    fn fsyncdir(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        self.check_inode_visible(inode)?;
+        self.inner.fsyncdir(ctx, inode, datasync, handle)
+    }
+
+    fn lseek(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.check_inode_visible(inode)?;
+        self.inner.lseek(ctx, inode, handle, offset, whence)
+    }
+
+    fn syncfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<()> {
+        self.check_inode_visible(inode)?;
+        self.inner.syncfs(ctx, inode)
     }
 
     // Readdir - return filtered entries from our cache with virtual offsets
@@ -603,6 +728,8 @@ impl FileSystem for MergedPathFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let parent_path = self.check_create_allowed(parent, name)?;
+        // Validate that the symlink target resolves within share boundaries
+        self.validate_symlink_target(&parent_path, linkname)?;
         let name_str = name.to_str().map_err(|_| enoent())?;
         let new_path = parent_path.join(name_str);
 
@@ -668,9 +795,34 @@ impl FileSystem for MergedPathFs {
         flags: u32,
     ) -> io::Result<()> {
         // Both source and destination child paths must be writable
-        self.check_create_allowed(olddir, oldname)?;
-        self.check_create_allowed(newdir, newname)?;
-        self.inner.rename(ctx, olddir, oldname, newdir, newname, flags)
+        let old_parent = self.check_create_allowed(olddir, oldname)?;
+        let new_parent = self.check_create_allowed(newdir, newname)?;
+
+        // Resolve the source inode BEFORE the rename so we can update its
+        // path mapping afterwards.  Look it up via the old parent + name.
+        let old_name_str = oldname.to_str().map_err(|_| enoent())?;
+        let new_name_str = newname.to_str().map_err(|_| enoent())?;
+        let old_child_path = old_parent.join(old_name_str);
+        let new_child_path = new_parent.join(new_name_str);
+
+        // Find the inode that currently maps to the old path so we can
+        // re-point it after the rename succeeds.
+        let source_inode = {
+            let paths = self.inode_paths.read().unwrap();
+            paths.iter()
+                .find(|(_, p)| **p == old_child_path)
+                .map(|(ino, _)| *ino)
+        };
+
+        self.inner.rename(ctx, olddir, oldname, newdir, newname, flags)?;
+
+        // Update the path mapping so future permission checks use the new
+        // location instead of the stale old path.
+        if let Some(ino) = source_inode {
+            self.set_inode_path(ino, new_child_path);
+        }
+
+        Ok(())
     }
 
     fn link(
@@ -1243,5 +1395,384 @@ mod tests {
         // returns EROFS for ReadOnly. The operation is rejected before
         // set_inode_path can overwrite the inode's tracked path, so the
         // permission laundering never occurs.
+    }
+
+    // ---- Security regression tests for vulnerabilities in MergedPathFs ----
+    //
+    // These tests require a real MergedPathFs backed by a temp directory.
+    // They exercise the actual code paths and assert security invariants.
+
+    use crate::soft_idmap::{GuestGid, GuestUid};
+
+    fn test_ctx() -> Context {
+        Context {
+            uid: GuestUid::from(0),
+            gid: GuestGid::from(0),
+            pid: std::process::id() as libc::pid_t,
+        }
+    }
+
+    fn make_test_fs(
+        root: &Path,
+        shares: Vec<Share>,
+    ) -> MergedPathFs {
+        let cfg = Config {
+            root_dir: root.to_str().unwrap().to_string(),
+            ..Config::default()
+        };
+        let fs = MergedPathFs::new(cfg, shares, None)
+            .expect("Failed to construct MergedPathFs");
+        // init with no capabilities — enough for basic ops
+        let _ = fs.init(FsOptions::empty());
+        fs
+    }
+
+    /// VULN 1: forget() must remove the inode's path mapping.
+    ///
+    /// Currently forget() delegates to inner without cleaning inode_paths.
+    /// If the inode number is recycled by the underlying filesystem, the
+    /// new inode silently inherits the old mapping and its permissions.
+    ///
+    /// Scenario: inode 42 was tracked as /rw-share/file. After forget,
+    /// the mapping must be gone so a recycled inode 42 can't inherit
+    /// /rw-share write permissions.
+    #[test]
+    fn test_vuln1_forget_must_clean_inode_paths() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln1");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(tmp.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        // Simulate a lookup having tracked an inode
+        let fake_inode: Inode = 99999;
+        fs.set_inode_path(fake_inode, tmp.join("tracked_file"));
+
+        // Verify the path is tracked
+        assert!(
+            fs.get_inode_path(fake_inode).is_some(),
+            "precondition: inode path should be tracked after set_inode_path"
+        );
+
+        // forget() should clean up the mapping
+        fs.forget(test_ctx(), fake_inode, 1);
+
+        assert!(
+            fs.get_inode_path(fake_inode).is_none(),
+            "SECURITY: inode path mapping persists after forget() — \
+             stale mapping allows permission bypass if the inode number is recycled"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// VULN 2: Read operations must recheck visibility against current shares.
+    ///
+    /// Currently getattr (and other read ops) delegate directly to inner
+    /// without calling check_inode_visible. If a share is removed via the
+    /// HTTP Admin API after a file was looked up, reads continue to succeed
+    /// when they should return ENOENT.
+    ///
+    /// Scenario: lookup /shared/file → inode tracked. Remove the share.
+    /// getattr(inode) should now fail, but currently succeeds.
+    #[test]
+    fn test_vuln2_getattr_must_recheck_visibility_after_share_removal() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln2");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("secret.txt"), b"secret").unwrap();
+
+        let share_path = tmp.to_str().unwrap();
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(share_path, ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Lookup the file to get its inode
+        let name = CStr::from_bytes_with_nul(b"secret.txt\0").unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, name)
+            .expect("lookup should succeed while share is active");
+        let inode = entry.inode;
+
+        // Confirm getattr works while share is active
+        assert!(
+            fs.getattr(ctx, inode, None).is_ok(),
+            "precondition: getattr should succeed while share is active"
+        );
+
+        // Remove the share — simulates admin revoking access at runtime
+        fs.registry().remove_share(Path::new(share_path));
+
+        // getattr must now fail because the inode is no longer under any share
+        let result = fs.getattr(ctx, inode, None);
+        assert!(
+            result.is_err(),
+            "SECURITY: getattr succeeded after share removal — \
+             read operations must recheck visibility against current share config"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// VULN 3: rename() must update inode_paths for the moved inode.
+    ///
+    /// Currently rename() checks permissions on source and destination but
+    /// never updates inode_paths. After the rename, subsequent permission
+    /// checks use the OLD path. This allows writes to succeed even if the
+    /// new location is under a read-only share (or vice versa).
+    ///
+    /// Scenario: rename /rw/file to /rw/subdir/file. After rename,
+    /// get_inode_path should return the NEW path, not the old one.
+    #[test]
+    fn test_vuln3_rename_must_update_inode_paths() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln3");
+        let _ = std::fs::create_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(tmp.join("subdir"));
+        std::fs::write(tmp.join("original.txt"), b"data").unwrap();
+
+        let share_path = tmp.to_str().unwrap();
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(share_path, ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Lookup root to make sure subdir inode is tracked
+        let subdir_name = CStr::from_bytes_with_nul(b"subdir\0").unwrap();
+        let subdir_entry = fs.lookup(ctx, fuse::ROOT_ID, subdir_name)
+            .expect("lookup subdir should succeed");
+        let subdir_inode = subdir_entry.inode;
+
+        // Lookup the file to get its inode
+        let name = CStr::from_bytes_with_nul(b"original.txt\0").unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, name)
+            .expect("lookup should succeed");
+        let file_inode = entry.inode;
+
+        // Verify initial path tracking
+        let initial_path = fs.get_inode_path(file_inode).unwrap();
+        assert_eq!(
+            initial_path,
+            tmp.join("original.txt"),
+            "precondition: inode should map to original path"
+        );
+
+        // Rename the file: root/original.txt → root/subdir/renamed.txt
+        let old_name = CStr::from_bytes_with_nul(b"original.txt\0").unwrap();
+        let new_name = CStr::from_bytes_with_nul(b"renamed.txt\0").unwrap();
+        fs.rename(ctx, fuse::ROOT_ID, old_name, subdir_inode, new_name, 0)
+            .expect("rename should succeed");
+
+        // After rename, the inode path must reflect the new location
+        let updated_path = fs.get_inode_path(file_inode).unwrap();
+        assert_eq!(
+            updated_path,
+            tmp.join("subdir").join("renamed.txt"),
+            "SECURITY: inode path not updated after rename — \
+             stale path causes permission checks to use the old location, \
+             allowing writes to succeed even if the new location is read-only"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- Security tests for path traversal vulnerabilities ----
+
+    /// VULN 4: lookup() must reject ".." as a name component.
+    ///
+    /// A malicious guest sends ".." as a FUSE LOOKUP name. PathBuf::join("..")
+    /// appends a literal ".." without resolving it, so the visibility check sees
+    /// "/share/project/.." which starts_with("/share/project") → true.
+    /// Meanwhile the inner PassthroughFs resolves ".." correctly, returning the
+    /// inode for the PARENT directory — outside the share.
+    #[test]
+    fn test_vuln4_lookup_must_reject_dotdot_name() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln4");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(tmp.join("project"));
+
+        let share_path = tmp.join("project");
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(share_path.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Lookup "project" to get the project inode
+        let project_name = CStr::from_bytes_with_nul(b"project\0").unwrap();
+        let project_entry = fs
+            .lookup(ctx, fuse::ROOT_ID, project_name)
+            .expect("lookup project should succeed");
+
+        // Now try to lookup ".." from the project directory.
+        // This MUST fail — a malicious guest uses this to escape the share.
+        let dotdot = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        let result = fs.lookup(ctx, project_entry.inode, dotdot);
+
+        assert!(
+            result.is_err(),
+            "SECURITY: lookup('..') succeeded — allows guest to escape share boundaries \
+             by walking up to the host root via repeated '..' lookups"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// VULN 5: lookup() must reject names containing '/'.
+    ///
+    /// FUSE name parameters should be single path components. A name like
+    /// "foo/../../../etc" would bypass visibility checks via the same
+    /// starts_with logic as ".." alone.
+    #[test]
+    fn test_vuln5_lookup_must_reject_slash_in_name() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln5");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(tmp.join("project"));
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(
+                tmp.join("project").to_str().unwrap(),
+                ShareMode::ReadWrite,
+            )],
+        );
+
+        let ctx = test_ctx();
+
+        let bad_name = CStr::from_bytes_with_nul(b"foo/bar\0").unwrap();
+        let result = fs.lookup(ctx, fuse::ROOT_ID, bad_name);
+
+        assert!(
+            result.is_err(),
+            "SECURITY: lookup with '/' in name succeeded — \
+             FUSE names must be single path components"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// VULN 6: symlink() must validate that the target (linkname) is within shares.
+    ///
+    /// Currently symlink() only checks that the symlink LOCATION is writable.
+    /// The symlink TARGET is never validated, allowing a guest to create a
+    /// symlink pointing to any host path (e.g., /etc/shadow).
+    #[test]
+    fn test_vuln6_symlink_must_reject_target_outside_shares() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln6");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(tmp.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Try to create a symlink pointing to /etc/shadow (absolute, outside share)
+        let linkname = CStr::from_bytes_with_nul(b"/etc/shadow\0").unwrap();
+        let name = CStr::from_bytes_with_nul(b"escape\0").unwrap();
+        let result = fs.symlink(ctx, linkname, fuse::ROOT_ID, name, Extensions::default());
+
+        assert!(
+            result.is_err(),
+            "SECURITY: symlink with target '/etc/shadow' (outside shares) was created — \
+             symlink targets must be validated against share boundaries"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// VULN 7: symlink() must reject relative targets that traverse outside shares.
+    ///
+    /// A relative symlink like "../../../../etc/shadow" resolves relative to
+    /// the parent directory. Enough ".." components escape the share boundary.
+    #[test]
+    fn test_vuln7_symlink_must_reject_relative_traversal_target() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln7");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(tmp.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Relative traversal that escapes the share
+        let linkname = CStr::from_bytes_with_nul(b"../../../../etc/shadow\0").unwrap();
+        let name = CStr::from_bytes_with_nul(b"escape2\0").unwrap();
+        let result = fs.symlink(ctx, linkname, fuse::ROOT_ID, name, Extensions::default());
+
+        assert!(
+            result.is_err(),
+            "SECURITY: symlink with relative traversal target was created — \
+             relative symlink targets that escape share boundaries must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Positive test: symlink with a target inside the share must still work.
+    #[test]
+    fn test_symlink_allows_target_within_share() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_symlink_ok");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("real_file"), b"hello").unwrap();
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(tmp.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Relative symlink that stays within the share
+        let linkname = CStr::from_bytes_with_nul(b"real_file\0").unwrap();
+        let name = CStr::from_bytes_with_nul(b"good_link\0").unwrap();
+        let result = fs.symlink(ctx, linkname, fuse::ROOT_ID, name, Extensions::default());
+
+        assert!(
+            result.is_ok(),
+            "symlink with target inside share should succeed, got: {:?}",
+            result.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// check_create_allowed must also reject ".." in child names,
+    /// preventing path traversal via mkdir, mknod, create, etc.
+    #[test]
+    fn test_vuln8_create_must_reject_dotdot_in_name() {
+        let tmp = std::env::temp_dir().join("virtiofsd_test_vuln8");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let fs = make_test_fs(
+            &tmp,
+            vec![make_share(tmp.to_str().unwrap(), ShareMode::ReadWrite)],
+        );
+
+        let ctx = test_ctx();
+
+        // Try to mkdir with ".." as the name
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        let result = fs.mkdir(ctx, fuse::ROOT_ID, name, 0o755, 0o022, Extensions::default());
+
+        assert!(
+            result.is_err(),
+            "SECURITY: mkdir with '..' name succeeded — \
+             create operations must reject path traversal components"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
